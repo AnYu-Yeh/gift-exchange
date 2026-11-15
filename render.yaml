@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: gift-exchange
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn 'app:create_app()' --workers 1 --threads 4 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    disk:
+      name: gift-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: INVITE_CODE
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+      - key: DEADLINE
+        value: '2026-11-17T23:59:00+08:00'
