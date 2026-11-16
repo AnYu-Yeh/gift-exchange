@@ -360,11 +360,11 @@ def create_app(config=None):
         admin_required()
         results = db().execute('''SELECT giver.name AS giver, recipient.name AS recipient,
             recipient.title AS title, recipient.link AS link
-            FROM pairs JOIN people AS giver ON giver.id=pairs.giver_id
-            JOIN people AS recipient ON recipient.id=pairs.recipient_id
+            FROM pairs JOIN people AS giver ON giver.id=pairs.giver
+            JOIN people AS recipient ON recipient.id=pairs.recipient
             ORDER BY giver.rowid''').fetchall()
-        pending = db().execute('''SELECT p.name FROM people p LEFT JOIN pairs x ON x.giver_id=p.id
-            WHERE x.giver_id IS NULL ORDER BY p.rowid''').fetchall()
+        pending = db().execute('''SELECT p.name FROM people p LEFT JOIN pairs x ON x.giver=p.id
+            WHERE x.giver IS NULL ORDER BY p.rowid''').fetchall()
         return render_template('admin_results.html', results=results, pending=pending)
 
     @app.post('/admin/deadline')
