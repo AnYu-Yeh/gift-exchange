@@ -262,7 +262,7 @@ def create_app(config=None):
             connection = db()
             with connection:
                 connection.execute('BEGIN IMMEDIATE')
-                if drawn() or closed():
+                if closed():
                     raise ValueError('報名已截止或已配對，無法新增參加者。')
                 connection.execute('INSERT INTO people (id,name,gender,password,title,link,note,image,partner) VALUES (?,?,?,?,?,?,?,?,?)',
                                    (person, name, fields[0], generate_password_hash(password), *fields[1:], partner))
@@ -318,7 +318,7 @@ def create_app(config=None):
             connection = db()
             with connection:
                 connection.execute('BEGIN IMMEDIATE')
-                if drawn() or closed():
+                if closed():
                     raise ValueError('已截止或完成配對，禮物資料已鎖定。')
                 connection.execute('UPDATE people SET gender=?,title=?,link=?,note=?,image=?,partner=? WHERE id=?', (*fields, partner, person['id']))
                 bump_revision()
@@ -354,6 +354,18 @@ def create_app(config=None):
             flash('負責人密碼不正確。', 'error')
         people = db().execute('SELECT id,name,gender,partner FROM people ORDER BY rowid').fetchall() if session.get('admin') else []
         return render_template('admin.html', people=people, drawn=drawn(), revision=revision())
+
+    @app.get('/admin/results')
+    def admin_results():
+        admin_required()
+        results = db().execute('''SELECT giver.name AS giver, recipient.name AS recipient,
+            recipient.title AS title, recipient.link AS link
+            FROM pairs JOIN people AS giver ON giver.id=pairs.giver_id
+            JOIN people AS recipient ON recipient.id=pairs.recipient_id
+            ORDER BY giver.rowid''').fetchall()
+        pending = db().execute('''SELECT p.name FROM people p LEFT JOIN pairs x ON x.giver_id=p.id
+            WHERE x.giver_id IS NULL ORDER BY p.rowid''').fetchall()
+        return render_template('admin_results.html', results=results, pending=pending)
 
     @app.post('/admin/deadline')
     def set_deadline():
