@@ -5,7 +5,7 @@ import sqlite3
 import time
 import zipfile
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,6 +13,53 @@ from flask import Flask, abort, flash, g, redirect, render_template, request, se
 from PIL import Image, ImageOps, UnidentifiedImageError
 from jinja2 import DictLoader
 from werkzeug.security import check_password_hash, generate_password_hash
+
+
+def match_people(people, previous=None):
+    """Randomized bipartite matching; finite search even for impossible rosters."""
+    rng = secrets.SystemRandom()
+    allowed = {}
+    names = {p['name']: p for p in people}
+    for p in people:
+        partner = p['partner']
+        if partner and partner not in names:
+            raise ValueError(f"{p['name']} 填寫的伴侶「{partner}」不在名單中，請先修正伴侶姓名或等對方報名。")
+        allowed[p['id']] = [q['id'] for q in people if q['id'] != p['id']
+            and q['name'] != partner and q['partner'] != p['name']
+            and ('祺' not in p['name'] or q['gender'] == '女')]
+
+    def solve(blocked=None):
+        owners = {}
+        def augment(giver, seen):
+            options = allowed[giver].copy()
+            rng.shuffle(options)
+            for recipient in options:
+                if (giver, recipient) == blocked or recipient in seen:
+                    continue
+                seen.add(recipient)
+                if recipient not in owners or augment(owners[recipient], seen):
+                    owners[recipient] = giver
+                    return True
+            return False
+        order = list(allowed)
+        rng.shuffle(order)
+        for giver in order:
+            if not augment(giver, set()):
+                return None
+        return {giver: recipient for recipient, giver in owners.items()}
+
+    result = solve()
+    if result is None:
+        raise ValueError('目前名單無法同時滿足不抽自己、情侶避配及名字含「祺」只能送女生的規則。請調整名單或性別／伴侶資料；原配對保持不變。')
+    if previous and result == previous:
+        edges = list(previous.items())
+        rng.shuffle(edges)
+        for edge in edges:
+            alternative = solve(edge)
+            if alternative:
+                return alternative
+        raise ValueError('目前限制下只有原本這一種配對，無法重抽出不同結果；原配對保持不變。')
+    return result
 
 
 def create_app(config=None):
@@ -66,7 +113,14 @@ def create_app(config=None):
             CREATE TABLE IF NOT EXISTS choices (id TEXT PRIMARY KEY, giver TEXT NOT NULL,
                 owner TEXT NOT NULL, position INTEGER NOT NULL, UNIQUE(giver, owner));
             CREATE TABLE IF NOT EXISTS attempts (key TEXT NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         ''')
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            if 'partner' not in {r[1] for r in db.execute('PRAGMA table_info(people)')}:
+                db.execute("ALTER TABLE people ADD COLUMN partner TEXT NOT NULL DEFAULT ''")
+            db.execute("INSERT OR IGNORE INTO settings VALUES ('deadline', ?)", (deadline.isoformat(),))
+            db.execute("INSERT OR IGNORE INTO settings VALUES ('revision', '0')")
 
     def db():
         if 'db' not in g:
@@ -84,7 +138,22 @@ def create_app(config=None):
         return db().execute('SELECT 1 FROM pairs LIMIT 1').fetchone() is not None
 
     def closed():
-        return datetime.now(timezone.utc) > deadline
+        return datetime.now(timezone.utc) > current_deadline()
+
+    def current_deadline():
+        return datetime.fromisoformat(db().execute("SELECT value FROM settings WHERE key='deadline'").fetchone()[0])
+
+    def revision():
+        return db().execute("SELECT value FROM settings WHERE key='revision'").fetchone()[0]
+
+    def bump_revision():
+        db().execute("UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
+
+    def partner_field(name):
+        partner = request.form.get('partner', '').strip() if request.form.get('couple') == 'yes' else ''
+        if request.form.get('couple') == 'yes' and (not partner or partner == name or len(partner) > 40):
+            raise ValueError('請填寫伴侶的完整報名姓名，不能填自己，最多 40 字。')
+        return partner
 
     def me():
         return db().execute('SELECT * FROM people WHERE id=?', (session.get('person'),)).fetchone()
@@ -110,8 +179,9 @@ def create_app(config=None):
 
     @app.context_processor
     def context():
-        return dict(csrf_token=session['csrf'], deadline_label=deadline.strftime('%Y/%m/%d %H:%M'),
-                    deadline_zone=deadline.strftime('UTC%z'))
+        local = current_deadline().astimezone(timezone(timedelta(hours=8)))
+        return dict(csrf_token=session['csrf'], deadline_label=local.strftime('%Y/%m/%d %H:%M'),
+                    deadline_zone='台灣時間 UTC+08:00', deadline_input=local.strftime('%Y-%m-%dT%H:%M'))
 
     def limit_attempts(identity):
         key = (request.remote_addr or '') + ':' + identity[:80]
@@ -187,15 +257,20 @@ def create_app(config=None):
             if not name or len(name) > 40 or not 8 <= len(password) <= 128:
                 raise ValueError('請填姓名（40 字以內），個人通行碼需為 8–128 字。')
             fields = gift_fields()
+            partner = partner_field(name)
             person = secrets.token_urlsafe(18)
             connection = db()
             with connection:
                 connection.execute('BEGIN IMMEDIATE')
                 if drawn() or closed():
                     raise ValueError('報名已截止或已配對，無法新增參加者。')
-                connection.execute('INSERT INTO people VALUES (?,?,?,?,?,?,?,?)',
-                                   (person, name, fields[0], generate_password_hash(password), *fields[1:]))
+                connection.execute('INSERT INTO people (id,name,gender,password,title,link,note,image,partner) VALUES (?,?,?,?,?,?,?,?,?)',
+                                   (person, name, fields[0], generate_password_hash(password), *fields[1:], partner))
+                bump_revision()
+            admin_session = session.get('admin')
             session.clear()
+            if admin_session:
+                session['admin'] = True
             session['person'] = person
             return redirect(url_for('dashboard'))
         except (ValueError, sqlite3.IntegrityError) as error:
@@ -209,7 +284,10 @@ def create_app(config=None):
         person = db().execute('SELECT * FROM people WHERE name=?', (name,)).fetchone()
         password = request.form.get('password', '')
         if person and len(password) <= 128 and check_password_hash(person['password'], password):
+            admin_session = session.get('admin')
             session.clear()
+            if admin_session:
+                session['admin'] = True
             session['person'] = person['id']
             return redirect(url_for('dashboard'))
         flash('姓名或個人通行碼不正確。', 'error')
@@ -236,12 +314,14 @@ def create_app(config=None):
             abort(403)
         try:
             fields = gift_fields(person)
+            partner = partner_field(person['name'])
             connection = db()
             with connection:
                 connection.execute('BEGIN IMMEDIATE')
                 if drawn() or closed():
                     raise ValueError('已截止或完成配對，禮物資料已鎖定。')
-                connection.execute('UPDATE people SET gender=?,title=?,link=?,note=?,image=? WHERE id=?', (*fields, person['id']))
+                connection.execute('UPDATE people SET gender=?,title=?,link=?,note=?,image=?,partner=? WHERE id=?', (*fields, partner, person['id']))
+                bump_revision()
             flash('願望已更新！', 'success')
         except ValueError as error:
             flash(str(error), 'error')
@@ -250,12 +330,10 @@ def create_app(config=None):
     @app.get('/image/<token>')
     def gift_image(token):
         person = me()
-        if not person and not session.get('admin'):
+        if not person:
             abort(403)
         if token == 'mine' and person:
             row = person
-        elif session.get('admin'):
-            row = db().execute('SELECT image FROM people WHERE id=?', (token,)).fetchone()
         else:
             row = db().execute('SELECT p.image FROM choices c JOIN people p ON p.id=c.owner WHERE c.id=? AND c.giver=?', (token, person['id'])).fetchone()
         if not row or not row['image']:
@@ -267,12 +345,74 @@ def create_app(config=None):
         if request.method == 'POST':
             limit_attempts('admin')
             if secrets.compare_digest(request.form.get('password', '').encode(), app.config['ADMIN_PASSWORD'].encode()):
+                participant = session.get('person')
                 session.clear()
+                if participant:
+                    session['person'] = participant
                 session['admin'] = True
                 return redirect(url_for('admin'))
             flash('負責人密碼不正確。', 'error')
-        people = db().execute('SELECT id,name,gender,title,link,note,image IS NOT NULL AS has_image FROM people ORDER BY rowid').fetchall() if session.get('admin') else []
-        return render_template('admin.html', people=people, drawn=drawn())
+        people = db().execute('SELECT id,name,gender,partner FROM people ORDER BY rowid').fetchall() if session.get('admin') else []
+        return render_template('admin.html', people=people, drawn=drawn(), revision=revision())
+
+    @app.post('/admin/deadline')
+    def set_deadline():
+        admin_required()
+        try:
+            value = datetime.fromisoformat(request.form.get('deadline', ''))
+            if value.tzinfo is not None:
+                raise ValueError()
+            value = value.replace(tzinfo=timezone(timedelta(hours=8)))
+            with db():
+                db().execute("UPDATE settings SET value=? WHERE key='deadline'", (value.isoformat(),))
+            flash('截止時間已更新（台灣時間）。已配對的名單仍會鎖定。', 'success')
+        except ValueError:
+            flash('請填寫有效的日期與時間。', 'error')
+        return redirect(url_for('admin'))
+
+    @app.post('/admin/remove/<person_id>')
+    def remove_person(person_id):
+        admin_required()
+        connection = db()
+        with connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if request.form.get('revision') != revision():
+                flash('名單已更新，請重新確認後操作。', 'error')
+            else:
+                person = connection.execute('SELECT name FROM people WHERE id=?', (person_id,)).fetchone()
+                if person:
+                    connection.execute('DELETE FROM choices')
+                    connection.execute('DELETE FROM pairs')
+                    connection.execute('DELETE FROM people WHERE id=?', (person_id,))
+                    connection.execute("UPDATE people SET partner='' WHERE partner=?", (person['name'],))
+                    bump_revision()
+                    flash('已移除參加者。原配對已取消，請確認名單後重新配對，並通知大家重新查看。', 'success')
+        return redirect(url_for('admin'))
+
+    @app.post('/admin/participant/<person_id>')
+    def edit_participant(person_id):
+        admin_required()
+        connection = db()
+        try:
+            with connection:
+                connection.execute('BEGIN IMMEDIATE')
+                if request.form.get('revision') != revision():
+                    raise ValueError('名單已更新，請重新確認。')
+                if drawn():
+                    raise ValueError('配對後無法修改性別與情侶資料。')
+                person = connection.execute('SELECT name FROM people WHERE id=?', (person_id,)).fetchone()
+                if not person:
+                    abort(404)
+                partner = partner_field(person['name'])
+                gender = request.form.get('gender', '').strip()
+                if not gender or len(gender) > 40:
+                    raise ValueError('請填有效性別，女生請填「女」。')
+                connection.execute('UPDATE people SET gender=?,partner=? WHERE id=?', (gender, partner, person_id))
+                bump_revision()
+            flash('參加者資料已更新，禮物仍保持隱藏。', 'success')
+        except ValueError as error:
+            flash(str(error), 'error')
+        return redirect(url_for('admin'))
 
     @app.post('/admin/draw')
     def draw():
@@ -281,24 +421,26 @@ def create_app(config=None):
         try:
             with connection:
                 connection.execute('BEGIN IMMEDIATE')
-                if drawn():
-                    raise ValueError('已完成配對，結果不會重新抽取。')
-                ids = [row[0] for row in connection.execute('SELECT id FROM people')]
+                if request.form.get('revision') != revision():
+                    raise ValueError('名單或配對已更新，請重新確認後再抽籤。')
+                people = connection.execute('SELECT id,name,gender,partner FROM people').fetchall()
+                ids = [row['id'] for row in people]
                 if len(ids) < 4:
                     raise ValueError('至少需要 4 人，才能排除自己的禮物並提供 3 個選項。')
                 rng = secrets.SystemRandom()
-                # Rejection sampling produces a uniform random derangement.
-                recipients = ids.copy()
-                while True:
-                    rng.shuffle(recipients)
-                    if all(a != b for a, b in zip(ids, recipients)):
-                        break
-                for giver, recipient in zip(ids, recipients):
+                previous = dict(connection.execute('SELECT giver,recipient FROM pairs').fetchall())
+                if previous and request.form.get('redraw') != 'yes':
+                    raise ValueError('已完成配對，請使用重新抽籤。')
+                matches = match_people(people, previous)
+                connection.execute('DELETE FROM choices')
+                connection.execute('DELETE FROM pairs')
+                for giver, recipient in matches.items():
                     connection.execute('INSERT INTO pairs VALUES (?,?)', (giver, recipient))
                     options = [recipient] + rng.sample([i for i in ids if i not in (giver, recipient)], 2)
                     rng.shuffle(options)
                     for position, owner in enumerate(options):
                         connection.execute('INSERT INTO choices VALUES (?,?,?,?)', (secrets.token_urlsafe(18), giver, owner, position))
+                bump_revision()
             flash('配對完成！大家現在可以登入查看自己的任務。', 'success')
         except ValueError as error:
             flash(str(error), 'error')
